@@ -1,39 +1,32 @@
 import os
 import sqlite3
+import time
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from groq import Groq
 from dotenv import load_dotenv
 
-# ----------------------------
-# ENV
-# ----------------------------
 load_dotenv()
 
-# ----------------------------
-# APP
-# ----------------------------
 app = Flask(__name__)
 
 # ----------------------------
-# AI CLIENT
+# CONFIG
 # ----------------------------
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# ----------------------------
-# MEMORY DB
-# ----------------------------
 DB_PATH = "/app/memory.db"
 
+ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER", "")  # your WhatsApp number
 USER_MODE = {}
+LAST_MESSAGE_TIME = {}
 
 # ----------------------------
-# INIT DB
+# DATABASE
 # ----------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,98 +35,96 @@ def init_db():
             message TEXT
         )
     """)
-
     conn.commit()
     conn.close()
 
 init_db()
 
 # ----------------------------
-# SAVE MESSAGE
+# MEMORY
 # ----------------------------
 def save_message(user_id, role, message):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute(
         "INSERT INTO messages (user_id, role, message) VALUES (?, ?, ?)",
         (user_id, role, message)
     )
-
     conn.commit()
     conn.close()
 
-# ----------------------------
-# LOAD MEMORY
-# ----------------------------
 def load_memory(user_id, limit=10):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute(
         "SELECT role, message FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, limit)
     )
-
     rows = cursor.fetchall()
     conn.close()
-
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
+def clear_memory(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
 # ----------------------------
-# COMMANDS
+# RATE LIMIT (ANTI-SPAM)
+# ----------------------------
+def is_spamming(user_id):
+    now = time.time()
+    last = LAST_MESSAGE_TIME.get(user_id, 0)
+
+    if now - last < 3:
+        return True
+
+    LAST_MESSAGE_TIME[user_id] = now
+    return False
+
+# ----------------------------
+# COMMAND SYSTEM
 # ----------------------------
 def handle_command(user_id, message):
     msg = message.strip().lower()
 
+    # HELP
     if msg == "/help":
         return (
             "Commands:\n"
-            "/help - show commands\n"
-            "/reset - clear memory\n"
-            "/memory - show last chats\n"
-            "/mode fun - fun AI\n"
-            "/mode smart - normal AI"
+            "/help\n"
+            "/reset\n"
+            "/memory\n"
+            "/mode fun\n"
+            "/mode smart"
         )
 
+    # RESET
     if msg == "/reset":
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
-        conn.commit()
-        conn.close()
+        clear_memory(user_id)
         return "Memory cleared ✔"
 
+    # MEMORY VIEW
     if msg == "/memory":
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        data = load_memory(user_id, 5)
+        if not data:
+            return "No memory yet."
+        return "\n".join([f"{d['role']}: {d['content']}" for d in data])
 
-        cursor.execute(
-            "SELECT role, message FROM messages WHERE user_id=? ORDER BY id DESC LIMIT 5",
-            (user_id,)
-        )
-
-        rows = cursor.fetchall()
-        conn.close()
-
-        if not rows:
-            return "No memory found."
-
-        return "\n".join([f"{r[0]}: {r[1]}" for r in reversed(rows)])
-
+    # MODE
     if msg.startswith("/mode"):
         mode = msg.replace("/mode", "").strip()
-
         if mode in ["fun", "smart"]:
             USER_MODE[user_id] = mode
             return f"Mode set to {mode} ✔"
-
         return "Use /mode fun or /mode smart"
 
     return None
 
 # ----------------------------
-# AI RESPONSE
+# AI ENGINE
 # ----------------------------
 def get_ai_response(user_id, message):
     try:
@@ -142,10 +133,11 @@ def get_ai_response(user_id, message):
         history = load_memory(user_id)
         mode = USER_MODE.get(user_id, "smart")
 
-        if mode == "fun":
-            system_prompt = "You are a funny WhatsApp assistant. Use emojis and jokes."
-        else:
-            system_prompt = "You are a helpful WhatsApp assistant. Be clear and short."
+        system_prompt = (
+            "You are a helpful WhatsApp AI assistant."
+            if mode == "smart"
+            else "You are a funny WhatsApp assistant. Use emojis and jokes."
+        )
 
         messages = [{"role": "system", "content": system_prompt}]
         messages += history
@@ -163,32 +155,36 @@ def get_ai_response(user_id, message):
 
     except Exception as e:
         print("AI ERROR:", e)
-        return "AI error. Try again."
+        return "AI error. Try again later."
 
 # ----------------------------
-# ROUTES
+# WEBHOOK
 # ----------------------------
 @app.route("/")
 def home():
-    return "Bot running 🚀"
+    return "WhatsApp AI Bot Running 🚀"
 
 @app.route("/bot", methods=["POST"])
 def bot():
-    incoming_msg = request.values.get("Body", "")
     user_id = request.values.get("From", "")
+    message = request.values.get("Body", "")
 
-    print("USER:", user_id, incoming_msg)
+    print("USER:", user_id, message)
 
-    command_reply = handle_command(user_id, incoming_msg)
+    # spam protection
+    if is_spamming(user_id):
+        return str(MessagingResponse().message("Slow down ⏳"))
+
+    # commands first
+    command_reply = handle_command(user_id, message)
 
     if command_reply:
         reply = command_reply
     else:
-        reply = get_ai_response(user_id, incoming_msg)
+        reply = get_ai_response(user_id, message)
 
     resp = MessagingResponse()
-    resp.message().body(reply)
-
+    resp.message(reply)
     return str(resp)
 
 # ----------------------------
