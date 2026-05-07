@@ -1,6 +1,7 @@
 import os
 import time
 import psycopg2
+import json
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from groq import Groq
@@ -38,7 +39,6 @@ def get_conn():
 def init_db():
     conn = get_conn()
     if conn is None:
-        print("Skipping DB init")
         return
 
     cur = conn.cursor()
@@ -142,7 +142,7 @@ def clear_memory(user_id):
     conn.close()
 
 # ----------------------------
-# FACT MEMORY (SMART MEMORY)
+# FACT MEMORY
 # ----------------------------
 def save_fact(user_id, key, value):
     conn = get_conn()
@@ -167,27 +167,46 @@ def get_facts(user_id):
         return {}
 
     cur = conn.cursor()
-
     cur.execute("SELECT key, value FROM facts WHERE user_id=%s", (user_id,))
     rows = cur.fetchall()
-
     conn.close()
 
     return {k: v for k, v in rows}
 
-def extract_fact(message):
-    message = message.lower()
+# ----------------------------
+# 🧠 AI MEMORY EXTRACTION
+# ----------------------------
+def extract_facts_ai(message):
+    try:
+        prompt = f"""
+Extract useful long-term facts from this message.
 
-    if "my name is" in message:
-        return ("name", message.split("my name is")[-1].strip())
+Message:
+"{message}"
 
-    if "i live in" in message:
-        return ("location", message.split("i live in")[-1].strip())
+Return ONLY valid JSON like:
+{{"name": "...", "location": "..."}}
 
-    if "i like" in message:
-        return ("likes", message.split("i like")[-1].strip())
+If nothing important, return empty JSON: {{}}
+"""
 
-    return None
+        res = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        text = res.choices[0].message.content.strip()
+
+        try:
+            data = json.loads(text)
+            return data
+        except:
+            print("NON-JSON MEMORY:", text)
+            return {}
+
+    except Exception as e:
+        print("MEMORY AI ERROR:", e)
+        return {}
 
 # ----------------------------
 # ANTI-SPAM
@@ -196,7 +215,7 @@ def is_spamming(user_id):
     now = time.time()
     last = LAST_MESSAGE_TIME.get(user_id, 0)
 
-    if now - last < 3:
+    if now - last < 2:
         return True
 
     LAST_MESSAGE_TIME[user_id] = now
@@ -206,80 +225,15 @@ def is_spamming(user_id):
 # COMMANDS
 # ----------------------------
 def handle_command(user_id, msg):
-    msg = msg.strip().lower()
-
-    if msg == "/help":
-        return "/help /reset /memory /facts /mode fun /mode smart"
+    msg = msg.lower().strip()
 
     if msg == "/reset":
         clear_memory(user_id)
         return "Memory cleared ✔"
 
-    if msg == "/memory":
-        data = load_memory(user_id, 5)
-        if not data:
-            return "No memory"
-        return "\n".join([f"{d['role']}: {d['content']}" for d in data])
-
     if msg == "/facts":
         facts = get_facts(user_id)
-        if not facts:
-            return "No facts saved"
-        return "\n".join([f"{k}: {v}" for k, v in facts.items()])
-
-    if msg.startswith("/mode"):
-        mode = msg.replace("/mode", "").strip()
-        if mode in ["fun", "smart"]:
-            USER_MODE[user_id] = mode
-            return f"Mode set to {mode}"
-        return "Use /mode fun or /mode smart"
-
-    return None
-
-# ----------------------------
-# ADMIN SYSTEM
-# ----------------------------
-def is_admin(user_id):
-    return user_id == ADMIN_NUMBER
-
-def admin_commands(user_id, msg):
-    if not is_admin(user_id):
-        return None
-
-    conn = get_conn()
-    if conn is None:
-        return "DB error"
-
-    cur = conn.cursor()
-
-    if msg == "/stats":
-        cur.execute("SELECT COUNT(*) FROM messages")
-        messages = cur.fetchone()[0]
-
-        cur.execute("SELECT COUNT(*) FROM users")
-        users = cur.fetchone()[0]
-
-        conn.close()
-        return f"Users: {users}\nMessages: {messages}"
-
-    if msg == "/users":
-        cur.execute("SELECT user_id FROM users LIMIT 10")
-        data = cur.fetchall()
-        conn.close()
-
-        return "\n".join([u[0] for u in data]) or "No users"
-
-    if msg == "/top":
-        cur.execute("""
-        SELECT user_id, message_count 
-        FROM users 
-        ORDER BY message_count DESC 
-        LIMIT 5
-        """)
-        data = cur.fetchall()
-        conn.close()
-
-        return "\n".join([f"{u[0]}: {u[1]}" for u in data]) or "No data"
+        return str(facts) if facts else "No facts"
 
     return None
 
@@ -290,17 +244,16 @@ def ai_response(user_id, message):
     try:
         save_message(user_id, "user", message)
 
-        # Save facts if detected
-        fact = extract_fact(message)
-        if fact:
-            save_fact(user_id, fact[0], fact[1])
+        # 🧠 Extract facts using AI
+        facts = extract_facts_ai(message)
 
-        history = load_memory(user_id)
-        facts = get_facts(user_id)
+        for k, v in facts.items():
+            save_fact(user_id, k, v)
 
-        fact_text = "\n".join([f"{k}: {v}" for k, v in facts.items()])
+        memory = load_memory(user_id)
+        user_facts = get_facts(user_id)
 
-        mode = USER_MODE.get(user_id, "smart")
+        fact_text = "\n".join([f"{k}: {v}" for k, v in user_facts.items()])
 
         system_prompt = f"""
 You are a smart assistant.
@@ -308,21 +261,17 @@ You are a smart assistant.
 User facts:
 {fact_text}
 
-Use them naturally in conversation.
+Use them naturally.
 """
 
-        if mode == "fun":
-            system_prompt += "\nBe funny and use emojis."
+        messages = [{"role": "system", "content": system_prompt}] + memory
 
-        messages = [{"role": "system", "content": system_prompt}]
-        messages += history
-
-        response = client.chat.completions.create(
+        res = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages
         )
 
-        reply = response.choices[0].message.content
+        reply = res.choices[0].message.content
 
         save_message(user_id, "assistant", reply)
 
@@ -337,7 +286,7 @@ Use them naturally in conversation.
 # ----------------------------
 @app.route("/")
 def home():
-    return "Bot running 🚀"
+    return "Running 🚀"
 
 @app.route("/bot", methods=["POST"])
 def bot():
@@ -349,17 +298,12 @@ def bot():
     if is_spamming(user_id):
         return str(MessagingResponse().message("Slow down ⏳"))
 
-    admin_reply = admin_commands(user_id, msg)
+    cmd = handle_command(user_id, msg)
 
-    if admin_reply:
-        reply = admin_reply
+    if cmd:
+        reply = cmd
     else:
-        cmd = handle_command(user_id, msg)
-
-        if cmd:
-            reply = cmd
-        else:
-            reply = ai_response(user_id, msg)
+        reply = ai_response(user_id, msg)
 
     resp = MessagingResponse()
     resp.message(reply)
