@@ -23,7 +23,7 @@ USER_MODE = {}
 LAST_MESSAGE_TIME = {}
 
 # ----------------------------
-# DB CONNECTION (SAFE)
+# DB CONNECTION
 # ----------------------------
 def get_conn():
     try:
@@ -58,6 +58,16 @@ def init_db():
         user_id TEXT UNIQUE,
         message_count INT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS facts (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT,
+        key TEXT,
+        value TEXT,
+        UNIQUE(user_id, key)
     )
     """)
 
@@ -132,6 +142,54 @@ def clear_memory(user_id):
     conn.close()
 
 # ----------------------------
+# FACT MEMORY (SMART MEMORY)
+# ----------------------------
+def save_fact(user_id, key, value):
+    conn = get_conn()
+    if conn is None:
+        return
+
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO facts (user_id, key, value)
+    VALUES (%s, %s, %s)
+    ON CONFLICT (user_id, key)
+    DO UPDATE SET value = EXCLUDED.value
+    """, (user_id, key, value))
+
+    conn.commit()
+    conn.close()
+
+def get_facts(user_id):
+    conn = get_conn()
+    if conn is None:
+        return {}
+
+    cur = conn.cursor()
+
+    cur.execute("SELECT key, value FROM facts WHERE user_id=%s", (user_id,))
+    rows = cur.fetchall()
+
+    conn.close()
+
+    return {k: v for k, v in rows}
+
+def extract_fact(message):
+    message = message.lower()
+
+    if "my name is" in message:
+        return ("name", message.split("my name is")[-1].strip())
+
+    if "i live in" in message:
+        return ("location", message.split("i live in")[-1].strip())
+
+    if "i like" in message:
+        return ("likes", message.split("i like")[-1].strip())
+
+    return None
+
+# ----------------------------
 # ANTI-SPAM
 # ----------------------------
 def is_spamming(user_id):
@@ -151,7 +209,7 @@ def handle_command(user_id, msg):
     msg = msg.strip().lower()
 
     if msg == "/help":
-        return "/help /reset /memory /mode fun /mode smart"
+        return "/help /reset /memory /facts /mode fun /mode smart"
 
     if msg == "/reset":
         clear_memory(user_id)
@@ -162,6 +220,12 @@ def handle_command(user_id, msg):
         if not data:
             return "No memory"
         return "\n".join([f"{d['role']}: {d['content']}" for d in data])
+
+    if msg == "/facts":
+        facts = get_facts(user_id)
+        if not facts:
+            return "No facts saved"
+        return "\n".join([f"{k}: {v}" for k, v in facts.items()])
 
     if msg.startswith("/mode"):
         mode = msg.replace("/mode", "").strip()
@@ -226,14 +290,29 @@ def ai_response(user_id, message):
     try:
         save_message(user_id, "user", message)
 
+        # Save facts if detected
+        fact = extract_fact(message)
+        if fact:
+            save_fact(user_id, fact[0], fact[1])
+
         history = load_memory(user_id)
+        facts = get_facts(user_id)
+
+        fact_text = "\n".join([f"{k}: {v}" for k, v in facts.items()])
+
         mode = USER_MODE.get(user_id, "smart")
 
-        system_prompt = (
-            "You are a helpful assistant."
-            if mode == "smart"
-            else "You are funny and use emojis."
-        )
+        system_prompt = f"""
+You are a smart assistant.
+
+User facts:
+{fact_text}
+
+Use them naturally in conversation.
+"""
+
+        if mode == "fun":
+            system_prompt += "\nBe funny and use emojis."
 
         messages = [{"role": "system", "content": system_prompt}]
         messages += history
