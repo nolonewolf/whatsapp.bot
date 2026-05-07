@@ -1,0 +1,5 @@
+flask
+twilio
+groq
+python-dotenv
+gunicorn
