@@ -6,27 +6,29 @@ from groq import Groq
 from dotenv import load_dotenv
 
 # ----------------------------
-# Load local environment (ignored in Railway)
+# ENV
 # ----------------------------
 load_dotenv()
 
 # ----------------------------
-# Flask app
+# APP
 # ----------------------------
 app = Flask(__name__)
 
 # ----------------------------
-# Groq API (secure)
+# AI CLIENT
 # ----------------------------
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # ----------------------------
-# IMPORTANT: Stable DB path for Railway
+# MEMORY DB
 # ----------------------------
 DB_PATH = "/app/memory.db"
 
+USER_MODE = {}
+
 # ----------------------------
-# INIT DATABASE
+# INIT DB
 # ----------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -79,23 +81,73 @@ def load_memory(user_id, limit=10):
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 # ----------------------------
-# AI RESPONSE FUNCTION
+# COMMANDS
+# ----------------------------
+def handle_command(user_id, message):
+    msg = message.strip().lower()
+
+    if msg == "/help":
+        return (
+            "Commands:\n"
+            "/help - show commands\n"
+            "/reset - clear memory\n"
+            "/memory - show last chats\n"
+            "/mode fun - fun AI\n"
+            "/mode smart - normal AI"
+        )
+
+    if msg == "/reset":
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+        return "Memory cleared ✔"
+
+    if msg == "/memory":
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT role, message FROM messages WHERE user_id=? ORDER BY id DESC LIMIT 5",
+            (user_id,)
+        )
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            return "No memory found."
+
+        return "\n".join([f"{r[0]}: {r[1]}" for r in reversed(rows)])
+
+    if msg.startswith("/mode"):
+        mode = msg.replace("/mode", "").strip()
+
+        if mode in ["fun", "smart"]:
+            USER_MODE[user_id] = mode
+            return f"Mode set to {mode} ✔"
+
+        return "Use /mode fun or /mode smart"
+
+    return None
+
+# ----------------------------
+# AI RESPONSE
 # ----------------------------
 def get_ai_response(user_id, message):
     try:
-        # Save user message
         save_message(user_id, "user", message)
 
-        # Load memory
         history = load_memory(user_id)
+        mode = USER_MODE.get(user_id, "smart")
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful WhatsApp AI assistant. Keep replies short, natural, and remember user context."
-            }
-        ]
+        if mode == "fun":
+            system_prompt = "You are a funny WhatsApp assistant. Use emojis and jokes."
+        else:
+            system_prompt = "You are a helpful WhatsApp assistant. Be clear and short."
 
+        messages = [{"role": "system", "content": system_prompt}]
         messages += history
 
         response = client.chat.completions.create(
@@ -105,48 +157,42 @@ def get_ai_response(user_id, message):
 
         reply = response.choices[0].message.content
 
-        # Save bot reply
         save_message(user_id, "assistant", reply)
 
         return reply
 
     except Exception as e:
         print("AI ERROR:", e)
-        return "⚠️ AI service error. Try again later."
+        return "AI error. Try again."
 
 # ----------------------------
-# HOME ROUTE (health check)
+# ROUTES
 # ----------------------------
 @app.route("/")
 def home():
-    return "WhatsApp Bot is running 🚀"
+    return "Bot running 🚀"
 
-# ----------------------------
-# WHATSAPP WEBHOOK
-# ----------------------------
 @app.route("/bot", methods=["POST"])
 def bot():
-    try:
-        incoming_msg = request.values.get("Body", "")
-        user_id = request.values.get("From", "")
+    incoming_msg = request.values.get("Body", "")
+    user_id = request.values.get("From", "")
 
-        print("USER:", user_id, incoming_msg)
+    print("USER:", user_id, incoming_msg)
 
+    command_reply = handle_command(user_id, incoming_msg)
+
+    if command_reply:
+        reply = command_reply
+    else:
         reply = get_ai_response(user_id, incoming_msg)
 
-        print("BOT:", reply)
+    resp = MessagingResponse()
+    resp.message().body(reply)
 
-        resp = MessagingResponse()
-        resp.message().body(reply)
-
-        return str(resp)
-
-    except Exception as e:
-        print("WEBHOOK ERROR:", e)
-        return "Error"
+    return str(resp)
 
 # ----------------------------
-# RAILWAY ENTRY POINT
+# RUN
 # ----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
