@@ -1,10 +1,10 @@
 import os
 import time
+import psycopg2
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from groq import Groq
 from dotenv import load_dotenv
-import psycopg2
 
 load_dotenv()
 
@@ -13,30 +13,52 @@ app = Flask(__name__)
 # ----------------------------
 # CONFIG
 # ----------------------------
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER")
+
+client = Groq(api_key=GROQ_API_KEY)
 
 USER_MODE = {}
 LAST_MESSAGE_TIME = {}
 
 # ----------------------------
-# DB CONNECTION
+# DB CONNECTION (SAFE)
 # ----------------------------
 def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+    try:
+        return psycopg2.connect(DATABASE_URL)
+    except Exception as e:
+        print("DB ERROR:", e)
+        return None
 
+# ----------------------------
+# INIT DB
+# ----------------------------
 def init_db():
     conn = get_conn()
+    if conn is None:
+        print("Skipping DB init")
+        return
+
     cur = conn.cursor()
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            role TEXT,
-            message TEXT
-        )
+    CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT,
+        role TEXT,
+        message TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT UNIQUE,
+        message_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
     """)
 
     conn.commit()
@@ -45,10 +67,33 @@ def init_db():
 init_db()
 
 # ----------------------------
-# MEMORY FUNCTIONS
+# USER TRACKING
+# ----------------------------
+def track_user(user_id):
+    conn = get_conn()
+    if conn is None:
+        return
+
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO users (user_id, message_count)
+    VALUES (%s, 1)
+    ON CONFLICT (user_id)
+    DO UPDATE SET message_count = users.message_count + 1
+    """, (user_id,))
+
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# MEMORY
 # ----------------------------
 def save_message(user_id, role, message):
     conn = get_conn()
+    if conn is None:
+        return
+
     cur = conn.cursor()
 
     cur.execute(
@@ -61,6 +106,9 @@ def save_message(user_id, role, message):
 
 def load_memory(user_id, limit=10):
     conn = get_conn()
+    if conn is None:
+        return []
+
     cur = conn.cursor()
 
     cur.execute(
@@ -75,10 +123,11 @@ def load_memory(user_id, limit=10):
 
 def clear_memory(user_id):
     conn = get_conn()
+    if conn is None:
+        return
+
     cur = conn.cursor()
-
     cur.execute("DELETE FROM messages WHERE user_id=%s", (user_id,))
-
     conn.commit()
     conn.close()
 
@@ -124,7 +173,54 @@ def handle_command(user_id, msg):
     return None
 
 # ----------------------------
-# AI ENGINE
+# ADMIN SYSTEM
+# ----------------------------
+def is_admin(user_id):
+    return user_id == ADMIN_NUMBER
+
+def admin_commands(user_id, msg):
+    if not is_admin(user_id):
+        return None
+
+    conn = get_conn()
+    if conn is None:
+        return "DB error"
+
+    cur = conn.cursor()
+
+    if msg == "/stats":
+        cur.execute("SELECT COUNT(*) FROM messages")
+        messages = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM users")
+        users = cur.fetchone()[0]
+
+        conn.close()
+        return f"Users: {users}\nMessages: {messages}"
+
+    if msg == "/users":
+        cur.execute("SELECT user_id FROM users LIMIT 10")
+        data = cur.fetchall()
+        conn.close()
+
+        return "\n".join([u[0] for u in data]) or "No users"
+
+    if msg == "/top":
+        cur.execute("""
+        SELECT user_id, message_count 
+        FROM users 
+        ORDER BY message_count DESC 
+        LIMIT 5
+        """)
+        data = cur.fetchall()
+        conn.close()
+
+        return "\n".join([f"{u[0]}: {u[1]}" for u in data]) or "No data"
+
+    return None
+
+# ----------------------------
+# AI RESPONSE
 # ----------------------------
 def ai_response(user_id, message):
     try:
@@ -169,15 +265,22 @@ def bot():
     user_id = request.values.get("From", "")
     msg = request.values.get("Body", "")
 
+    track_user(user_id)
+
     if is_spamming(user_id):
         return str(MessagingResponse().message("Slow down ⏳"))
 
-    cmd = handle_command(user_id, msg)
+    admin_reply = admin_commands(user_id, msg)
 
-    if cmd:
-        reply = cmd
+    if admin_reply:
+        reply = admin_reply
     else:
-        reply = ai_response(user_id, msg)
+        cmd = handle_command(user_id, msg)
+
+        if cmd:
+            reply = cmd
+        else:
+            reply = ai_response(user_id, msg)
 
     resp = MessagingResponse()
     resp.message(reply)
