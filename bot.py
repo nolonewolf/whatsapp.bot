@@ -20,11 +20,10 @@ ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER")
 
 client = Groq(api_key=GROQ_API_KEY)
 
-USER_MODE = {}
 LAST_MESSAGE_TIME = {}
 
 # ----------------------------
-# DB CONNECTION
+# DATABASE CONNECTION
 # ----------------------------
 def get_conn():
     try:
@@ -34,7 +33,7 @@ def get_conn():
         return None
 
 # ----------------------------
-# INIT DB
+# INIT DATABASE
 # ----------------------------
 def init_db():
     conn = get_conn()
@@ -44,7 +43,7 @@ def init_db():
 
     cur = conn.cursor()
 
-    # Messages memory
+    # Chat memory
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -54,7 +53,7 @@ def init_db():
     )
     """)
 
-    # User tracking
+    # Users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -64,7 +63,7 @@ def init_db():
     )
     """)
 
-    # Smart memory facts
+    # Smart facts
     cur.execute("""
     CREATE TABLE IF NOT EXISTS facts (
         id SERIAL PRIMARY KEY,
@@ -112,18 +111,15 @@ def save_message(user_id, role, message):
 
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        INSERT INTO messages (user_id, role, message)
-        VALUES (%s, %s, %s)
-        """,
-        (user_id, role, message)
-    )
+    cur.execute("""
+    INSERT INTO messages (user_id, role, message)
+    VALUES (%s, %s, %s)
+    """, (user_id, role, message))
 
     conn.commit()
     conn.close()
 
-def load_memory(user_id, limit=10):
+def load_memory(user_id, limit=4):
     conn = get_conn()
 
     if conn is None:
@@ -131,16 +127,13 @@ def load_memory(user_id, limit=10):
 
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT role, message
-        FROM messages
-        WHERE user_id=%s
-        ORDER BY id DESC
-        LIMIT %s
-        """,
-        (user_id, limit)
-    )
+    cur.execute("""
+    SELECT role, message
+    FROM messages
+    WHERE user_id=%s
+    ORDER BY id DESC
+    LIMIT %s
+    """, (user_id, limit))
 
     rows = cur.fetchall()
 
@@ -213,22 +206,22 @@ def get_facts(user_id):
     return {k: v for k, v in rows}
 
 # ----------------------------
-# SMART FACT EXTRACTION
+# SMART MEMORY EXTRACTION
 # ----------------------------
 def extract_facts_ai(message):
     try:
         prompt = f"""
-Extract ONLY useful long-term user facts.
+Extract ONLY important long-term user facts.
 
 Possible facts:
 - name
 - age
 - country
 - hobbies
-- favorite things
 - goals
-- job
+- favorite things
 - school
+- job
 
 Message:
 "{message}"
@@ -237,7 +230,6 @@ RULES:
 - Return ONLY valid JSON
 - No markdown
 - No explanation
-- No extra text
 - If nothing important exists return {{}}
 
 Example:
@@ -256,12 +248,13 @@ Example:
                     "content": prompt
                 }
             ],
-            temperature=0
+            temperature=0,
+            max_tokens=80
         )
 
         text = res.choices[0].message.content.strip()
 
-        # Remove markdown if AI adds it
+        # Remove markdown if model adds it
         text = text.replace("```json", "")
         text = text.replace("```", "")
         text = text.strip()
@@ -274,7 +267,7 @@ Example:
 
             return {}
 
-        except json.JSONDecodeError:
+        except:
             return {}
 
     except Exception as e:
@@ -302,12 +295,10 @@ def is_spamming(user_id):
 def handle_command(user_id, msg):
     msg = msg.lower().strip()
 
-    # Reset memory
     if msg == "/reset":
         clear_memory(user_id)
-        return "Memory cleared ✔"
+        return "✅ Memory cleared"
 
-    # Show facts
     if msg == "/facts":
         facts = get_facts(user_id)
 
@@ -318,7 +309,6 @@ def handle_command(user_id, msg):
             [f"{k}: {v}" for k, v in facts.items()]
         )
 
-    # Help menu
     if msg == "/help":
         return (
             "🤖 Commands:\n\n"
@@ -337,16 +327,17 @@ def ai_response(user_id, message):
         # Save user message
         save_message(user_id, "user", message)
 
-        # Extract smart memory
-        facts = extract_facts_ai(message)
+        # Extract memory ONLY for meaningful messages
+        if len(message) > 20:
+            facts = extract_facts_ai(message)
 
-        for k, v in facts.items():
-            save_fact(user_id, k, str(v))
+            for k, v in facts.items():
+                save_fact(user_id, k, str(v))
 
-        # Load conversation memory
+        # Conversation memory
         memory = load_memory(user_id)
 
-        # Load facts
+        # User facts
         user_facts = get_facts(user_id)
 
         fact_text = "\n".join(
@@ -360,11 +351,11 @@ User facts:
 {fact_text}
 
 Rules:
-- Be natural
+- Reply naturally
 - Be conversational
-- Use user facts naturally
-- Keep responses clear
-- Avoid repeating yourself
+- Be helpful
+- Keep answers concise
+- Avoid extremely long responses
 """
 
         messages = [
@@ -374,11 +365,12 @@ Rules:
             }
         ] + memory
 
+        # FAST RESPONSE
         res = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
-            temperature=0.7,
-            max_tokens=500
+            temperature=0.5,
+            max_tokens=150
         )
 
         reply = res.choices[0].message.content.strip()
@@ -408,13 +400,13 @@ def bot():
         if not msg:
             return "No message"
 
-        # Track user
+        # Track users
         track_user(user_id)
 
         # Anti spam
         if is_spamming(user_id):
             resp = MessagingResponse()
-            resp.message("⏳ Slow down a little.")
+            resp.message("⏳ Slow down a bit.")
             return str(resp)
 
         # Commands
@@ -425,7 +417,7 @@ def bot():
         else:
             reply = ai_response(user_id, msg)
 
-        # Twilio response
+        # Send Twilio reply
         resp = MessagingResponse()
         resp.message(reply)
 
@@ -440,7 +432,7 @@ def bot():
         return str(resp)
 
 # ----------------------------
-# RUN
+# RUN APP
 # ----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
