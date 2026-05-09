@@ -370,7 +370,7 @@ Rules:
             model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.5,
-            max_tokens=150
+            max_tokens=500
         )
 
         reply = res.choices[0].message.content.strip()
