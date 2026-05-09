@@ -43,7 +43,7 @@ def init_db():
 
     cur = conn.cursor()
 
-    # Chat memory
+    # Conversation memory
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -63,7 +63,7 @@ def init_db():
     )
     """)
 
-    # Smart facts
+    # Smart memory facts
     cur.execute("""
     CREATE TABLE IF NOT EXISTS facts (
         id SERIAL PRIMARY KEY,
@@ -119,7 +119,7 @@ def save_message(user_id, role, message):
     conn.commit()
     conn.close()
 
-def load_memory(user_id, limit=4):
+def load_memory(user_id, limit=3):
     conn = get_conn()
 
     if conn is None:
@@ -275,7 +275,7 @@ Example:
         return {}
 
 # ----------------------------
-# ANTI SPAM
+# ANTI-SPAM
 # ----------------------------
 def is_spamming(user_id):
     now = time.time()
@@ -327,17 +327,17 @@ def ai_response(user_id, message):
         # Save user message
         save_message(user_id, "user", message)
 
-        # Extract memory ONLY for meaningful messages
+        # Extract memory only for useful messages
         if len(message) > 20:
             facts = extract_facts_ai(message)
 
             for k, v in facts.items():
                 save_fact(user_id, k, str(v))
 
-        # Conversation memory
+        # Load recent memory
         memory = load_memory(user_id)
 
-        # User facts
+        # Load user facts
         user_facts = get_facts(user_id)
 
         fact_text = "\n".join(
@@ -345,17 +345,18 @@ def ai_response(user_id, message):
         )
 
         system_prompt = f"""
-You are a smart helpful AI assistant.
+You are a smart, helpful, conversational AI assistant.
 
 User facts:
 {fact_text}
 
 Rules:
-- Reply naturally
-- Be conversational
-- Be helpful
-- Keep answers concise
-- Avoid extremely long responses
+- Give detailed helpful answers
+- Be conversational and natural
+- Explain clearly
+- Answer coding questions well
+- Give educational explanations when needed
+- Avoid repeating yourself
 """
 
         messages = [
@@ -365,12 +366,12 @@ Rules:
             }
         ] + memory
 
-        # FAST RESPONSE
+        # MAIN AI RESPONSE
         res = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.5,
-            max_tokens=400
+            max_tokens=1000
         )
 
         reply = res.choices[0].message.content.strip()
@@ -403,13 +404,13 @@ def bot():
         # Track users
         track_user(user_id)
 
-        # Anti spam
+        # Anti-spam
         if is_spamming(user_id):
             resp = MessagingResponse()
             resp.message("⏳ Slow down a bit.")
             return str(resp)
 
-        # Commands
+        # Handle commands
         cmd = handle_command(user_id, msg)
 
         if cmd:
@@ -417,7 +418,7 @@ def bot():
         else:
             reply = ai_response(user_id, msg)
 
-        # Send Twilio reply
+        # Send WhatsApp reply
         resp = MessagingResponse()
         resp.message(reply)
 
